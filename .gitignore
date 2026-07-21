@@ -10,3 +10,7 @@ Desktop.ini
 
 # Logs
 *.log
+
+# Reasonix workspace
+.playwright-mcp/
+.reasonix/
