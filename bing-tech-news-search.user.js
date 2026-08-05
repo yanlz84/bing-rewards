@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         Bing Rewards Search
 // @namespace    http://tampermonkey.net/
-// @version      1.6
-// @description  在 Bing 上自动搜索 Noozra 科技新闻，积累 Microsoft Rewards 积分
+// @version      1.7
+// @description  在 Bing 上自动搜索 Noozra 科技新闻 + Rewards 每日签到与每日活动（3 个搜索），积累 Microsoft Rewards 积分
 // @author       You
 // @match        *://cn.bing.com/*
 // @match        *://www.bing.com/*
+// @match        *://rewards.bing.com/*
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_xmlhttpRequest
@@ -63,6 +64,19 @@
             '.id_proflink ~ span',
             '.id_proflink + span',
         ],
+        // ===== Rewards 每日活动（签到 + 3 个搜索）配置 =====
+        // rewards.bing.com dashboard 上的每日活动区域
+        dailysetSection: '#dailyset',
+        // 每日活动卡片链接（跳转到 Bing 搜索页，打开后自动上报完成）
+        dailysetLink: 'a[href*="bing.com/search"]',
+        // 已完成的链接文本标记（含此文本表示该活动已完成，跳过）
+        dailysetDoneText: '已完成',
+        // 未完成的活动链接文本标记（含 +10 表示待完成）
+        dailysetPendingText: '+10',
+        // 每个活动页停留时间（毫秒），等待 reportActivity 上报完成
+        dailysetWaitMs: 6000,
+        // 完成所有活动后返回的 dashboard 地址
+        dashboardUrl: 'https://rewards.bing.com/dashboard?ref=rewardspanel',
     };
 
     // ============================================================
@@ -80,6 +94,12 @@
         autoStartTriggeredDate: 'autoStartTriggeredDate',  // 记录上次自动启动的日期，防止刷新后重复触发
         autoStartHour: 'autoStartHour',      // 自动启动-小时
         autoStartMinute: 'autoStartMinute',  // 自动启动-分钟
+        // 每日活动（签到 + 3 个搜索）状态
+        dailysetQueue: 'dailysetQueue',          // 待完成的活动链接队列
+        dailysetIndex: 'dailysetIndex',          // 当前进行到第几个
+        dailysetActive: 'dailysetActive',        // 每日活动流程是否进行中
+        dailysetStartPoints: 'dailysetStartPoints',  // 开始时的积分，用于计算本次获得
+        streakDays: 'streakDays',                // 每日连续打卡天数（缓存显示用）
     };
 
     function getState(key, defaultValue) {
@@ -113,6 +133,9 @@
     let statusDisplay = null;
     let btnStart = null;
     let btnStop = null;
+    let streakDisplay = null;
+    let dailysetDisplay = null;
+    let btnDailySet = null;
     let manualInputRow = null;
     let manualInput = null;
     let manualBtn = null;
@@ -195,6 +218,17 @@
         #bing-bili-panel .bili-btn-stop:hover {
             background: #d32f2f;
         }
+        #bing-bili-panel .bili-btn-daily {
+            background: #ff9800;
+            color: #fff;
+        }
+        #bing-bili-panel .bili-btn-daily:hover {
+            background: #f57c00;
+        }
+        #bing-bili-panel .bili-btn-daily:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
         #bing-bili-panel .bili-btn-start:disabled,
         #bing-bili-panel .bili-btn-stop:disabled {
             opacity: 0.5;
@@ -241,7 +275,31 @@
     `);
 
     function createPanel() {
-        if (document.getElementById('bing-bili-panel')) return;
+        // 面板可能已存在（例如脚本被重复注入或旧版本残留），此时补全元素引用即可
+        if (document.getElementById('bing-bili-panel')) {
+            panel = document.getElementById('bing-bili-panel');
+            livePointsDisplay = panel.querySelector('#bili-live-points');
+            startPointsDisplay = panel.querySelector('#bili-start-points');
+            currentPointsDisplay = panel.querySelector('#bili-current-points');
+            deltaDisplay = panel.querySelector('#bili-delta-points');
+            statusDisplay = panel.querySelector('#bili-status-text');
+            btnStart = panel.querySelector('#bili-btn-start');
+            btnStop = panel.querySelector('#bili-btn-stop');
+            streakDisplay = panel.querySelector('#bili-streak');
+            dailysetDisplay = panel.querySelector('#bili-dailyset');
+            btnDailySet = panel.querySelector('#bili-btn-dailyset');
+            manualInputRow = panel.querySelector('#bili-input-row');
+            manualInput = panel.querySelector('#bili-manual-input');
+            manualBtn = panel.querySelector('#bili-manual-btn');
+            timeInput = panel.querySelector('#bili-time-input');
+            timeBtn = panel.querySelector('#bili-time-btn');
+            // 补挂每日活动按钮事件（防止重复绑定）
+            if (btnDailySet && !btnDailySet._biliBound) {
+                btnDailySet.addEventListener('click', onDailySetClick);
+                btnDailySet._biliBound = true;
+            }
+            return;
+        }
 
         panel = document.createElement('div');
         panel.id = 'bing-bili-panel';
@@ -264,10 +322,21 @@
                 <span class="bili-label">增加:</span>
                 <span class="bili-delta" id="bili-delta-points">+0</span>
             </div>
+            <div class="bili-row">
+                <span class="bili-label">每日打卡:</span>
+                <span class="bili-value" id="bili-streak">-</span>
+            </div>
+            <div class="bili-row">
+                <span class="bili-label">每日活动:</span>
+                <span class="bili-value" id="bili-dailyset">-</span>
+            </div>
             <div class="bili-status" id="bili-status-text">⏳ 检测中...</div>
             <div class="bili-actions">
                 <button class="bili-btn bili-btn-start" id="bili-btn-start">▶ 开始</button>
                 <button class="bili-btn bili-btn-stop" id="bili-btn-stop">■ 停止</button>
+            </div>
+            <div class="bili-actions" style="margin-top: 6px;">
+                <button class="bili-btn bili-btn-daily" id="bili-btn-dailyset">🎯 签到+每日活动</button>
             </div>
             <div class="bili-input-row" id="bili-input-row">
                 <span class="bili-label">手动输入:</span>
@@ -290,6 +359,9 @@
         statusDisplay = panel.querySelector('#bili-status-text');
         btnStart = panel.querySelector('#bili-btn-start');
         btnStop = panel.querySelector('#bili-btn-stop');
+        streakDisplay = panel.querySelector('#bili-streak');
+        dailysetDisplay = panel.querySelector('#bili-dailyset');
+        btnDailySet = panel.querySelector('#bili-btn-dailyset');
         manualInputRow = panel.querySelector('#bili-input-row');
         manualInput = panel.querySelector('#bili-manual-input');
         manualBtn = panel.querySelector('#bili-manual-btn');
@@ -298,6 +370,8 @@
 
         btnStart.addEventListener('click', onStart);
         btnStop.addEventListener('click', onStop);
+        btnDailySet.addEventListener('click', onDailySetClick);
+        btnDailySet._biliBound = true;
         manualBtn.addEventListener('click', onManualPoints);
         timeBtn.addEventListener('click', onSaveTime);
 
@@ -379,7 +453,7 @@
     // 尝试读取并显示当前 Bing 积分
     function tryReadLivePoints(retries) {
         retries = retries || 0;
-        const points = readBingPoints();
+        const points = isRewardsDashboard() ? readDashboardPoints() : readBingPoints();
         if (points !== null) {
             livePointsDisplay.textContent = points;
             livePointsDisplay.style.color = '#81c784';
@@ -576,7 +650,7 @@
     }
 
     function refreshLivePoints() {
-        const points = readBingPoints();
+        const points = isRewardsDashboard() ? readDashboardPoints() : readBingPoints();
         if (points !== null && livePointsDisplay) {
             livePointsDisplay.textContent = points;
             livePointsDisplay.style.color = '#81c784';
@@ -588,6 +662,10 @@
                 deltaDisplay.textContent = delta >= 0 ? `+${delta}` : `${delta}`;
                 deltaDisplay.style.color = delta > 0 ? '#81c784' : '#ff8a80';
             }
+        }
+        // dashboard 上周期刷新打卡/每日活动状态
+        if (isRewardsDashboard()) {
+            updateDashboardInfo();
         }
     }
 
@@ -782,6 +860,9 @@
     //  页面加载后的处理（检查是否是从搜索跳转回来的）
     // ============================================================
     function onPageLoad() {
+        // 每日活动流程优先处理（在 www.bing.com 上等待上报后继续下一个）
+        if (handleDailySetFlow()) return;
+
         // 检查是否是在搜索结果页（URL 有 q= 参数）
         const url = new URL(window.location.href);
         const hasSearchQuery = url.searchParams.has('q');
@@ -1058,6 +1139,219 @@
     }
 
     // ============================================================
+    //  Rewards 每日活动（签到 + 3 个搜索）
+    // ============================================================
+    /**
+     * 判断当前页面是否为 rewards.bing.com 仪表盘
+     */
+    function isRewardsDashboard() {
+        const host = window.location.hostname;
+        return host === 'rewards.bing.com' || host.endsWith('.rewards.bing.com');
+    }
+
+    /**
+     * 读取 dashboard 上的积分（"可用积分"卡片 → 顶栏 header → 个人资料按钮）
+     */
+    function readDashboardPoints() {
+        // "可用积分"兑换链接（最可靠）
+        const redeemLink = [...document.querySelectorAll('a[href*="/redeem"]')].find(a => a.textContent.includes('可用积分'));
+        if (redeemLink) {
+            const m = redeemLink.textContent.match(/(\d[\d,]*)/);
+            if (m) return parseInt(m[1].replace(/,/g, ''), 10);
+        }
+        // 顶栏 header / banner 中的第一个数字
+        const header = document.querySelector('header, [class*="banner" i]');
+        if (header) {
+            const m = header.textContent.match(/(\d[\d,]*)/);
+            if (m) return parseInt(m[1].replace(/,/g, ''), 10);
+        }
+        // 顶栏个人资料按钮
+        const profileBtn = [...document.querySelectorAll('button')].find(b => b.textContent.includes('查看个人资料'));
+        if (profileBtn) {
+            const m = profileBtn.textContent.match(/(\d[\d,]*)/);
+            if (m) return parseInt(m[1].replace(/,/g, ''), 10);
+        }
+        return null;
+    }
+
+    /**
+     * 更新面板上的每日打卡天数与每日活动进度
+     */
+    function updateDashboardInfo() {
+        if (!streakDisplay || !dailysetDisplay) return;
+
+        // 每日连续打卡天数（"你的进度"区域）
+        const streakBtn = [...document.querySelectorAll('button')].find(b => b.textContent.includes('每日连续打卡'));
+        if (streakBtn) {
+            const m = streakBtn.textContent.match(/(\d[\d,]*)\s*天/);
+            const days = m ? m[1] : '未知';
+            streakDisplay.textContent = days + ' 天';
+            setState(STATE_KEYS.streakDays, days);
+        } else {
+            // 非 dashboard 页面显示缓存值
+            const cached = getState(STATE_KEYS.streakDays, '');
+            if (cached) streakDisplay.textContent = cached + ' 天';
+        }
+
+        // 每日活动进度（"活动"区域：活动: x/3）
+        const progBtn = [...document.querySelectorAll('button')].find(b => b.textContent.includes('每日活动') && b.textContent.includes('活动:'));
+        if (progBtn) {
+            // 只匹配叶子文本元素（无子元素），避免与徽章数字拼接（如"2/3"+"6"→"2/36"）
+            const textEl = [...progBtn.querySelectorAll('p, span, div')]
+                .find(el => el.children.length === 0 && /^\s*活动:\s*\d+\s*\/\s*\d+\s*$/.test(el.textContent));
+            const m = (textEl ? textEl.textContent : progBtn.textContent)
+                .match(/活动:\s*(\d+)\s*\/\s*(\d+)/);
+            if (m) {
+                dailysetDisplay.textContent = m[1] + '/' + m[2];
+            }
+        }
+    }
+
+    /**
+     * 点击"签到+每日活动"按钮
+     * 不在 dashboard 时先跳转到 dashboard 并带启动参数
+     */
+    function onDailySetClick() {
+        if (!isRewardsDashboard()) {
+            statusDisplay.textContent = '🚀 正在打开 Rewards 仪表盘...';
+            window.location.href = CONFIG.dashboardUrl + '&dailyset_start=1';
+            return;
+        }
+        startDailySet();
+    }
+
+    /**
+     * 启动每日活动流程：
+     * 1. 收集 #dailyset 中未完成的活动链接
+     * 2. 依次跳转打开，Bing 搜索页加载后自动上报完成
+     */
+    function startDailySet() {
+        // 新闻搜索流程进行中时不允许同时运行
+        const status = getState(STATE_KEYS.status, 'idle');
+        if (status === 'searching' || status === 'waiting' || status === 'fetching') {
+            statusDisplay.textContent = '⚠️ 新闻搜索运行中，请先停止再执行每日活动';
+            return;
+        }
+
+        const section = document.querySelector(CONFIG.dailysetSection);
+        if (!section) {
+            statusDisplay.textContent = '⚠️ 未找到每日活动区域（#dailyset）';
+            return;
+        }
+
+        // 收集未完成的活动链接（已完成的含"已完成"文本，跳过）
+        const links = [...section.querySelectorAll(CONFIG.dailysetLink)]
+            .filter(a => !a.textContent.includes(CONFIG.dailysetDoneText))
+            .map(a => a.href);
+
+        if (links.length === 0) {
+            statusDisplay.textContent = '✅ 今日每日活动已全部完成！';
+            updateDashboardInfo();
+            return;
+        }
+
+        // 记录起始积分
+        const pts = readDashboardPoints() || readBingPoints();
+        if (pts) setState(STATE_KEYS.dailysetStartPoints, pts);
+
+        setState(STATE_KEYS.dailysetQueue, links);
+        setState(STATE_KEYS.dailysetIndex, 0);
+        setState(STATE_KEYS.dailysetActive, true);
+
+        statusDisplay.textContent = `🎯 每日活动开始，还有 ${links.length} 个未完成`;
+        updateUI();
+
+        // 跳转到第一个活动链接（Bing 搜索页会自动上报完成）
+        window.location.href = links[0];
+    }
+
+    /**
+     * 搜索页上的每日活动流程（在 www.bing.com 上执行）：
+     * 等待当前活动上报完成后，跳转下一个活动或返回 dashboard。
+     * 返回 true 表示已处理（当前处于每日活动流程中）。
+     */
+    function handleDailySetFlow() {
+        const active = getState(STATE_KEYS.dailysetActive, false);
+        if (!active) return false;
+
+        const queue = getState(STATE_KEYS.dailysetQueue, []);
+        const index = getState(STATE_KEYS.dailysetIndex, 0);
+        if (!Array.isArray(queue) || queue.length === 0) {
+            setState(STATE_KEYS.dailysetActive, false);
+            return false;
+        }
+
+        if (statusDisplay) {
+            statusDisplay.textContent = `🎯 每日活动 (${index + 1}/${queue.length}) 上报中，稍后自动继续...`;
+        }
+        // 避免与新闻搜索流程冲突：暂停新闻搜索的积分轮询和滚动
+        stopRandomScrolling();
+        stopPointsPolling();
+        if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
+
+        // 等待 reportActivity 上报完成，然后继续下一个
+        const waitMs = CONFIG.dailysetWaitMs || 6000;
+        setTimeout(() => {
+            const next = index + 1;
+            if (next >= queue.length) {
+                // 全部完成 → 返回 dashboard 查看结果
+                setState(STATE_KEYS.dailysetActive, false);
+                setState(STATE_KEYS.dailysetQueue, []);
+                window.location.href = CONFIG.dashboardUrl + '&dailyset_done=1';
+            } else {
+                setState(STATE_KEYS.dailysetIndex, next);
+                window.location.href = queue[next];
+            }
+        }, waitMs);
+
+        return true;
+    }
+
+    /**
+     * rewards.bing.com 仪表盘初始化：
+     * 显示打卡/活动状态，处理 URL 启动/完成参数
+     */
+    function initDashboard() {
+        // 显示打卡天数和每日活动进度
+        updateDashboardInfo();
+
+        // 尝试读取积分
+        const pts = readDashboardPoints();
+        if (pts !== null && livePointsDisplay) {
+            livePointsDisplay.textContent = pts;
+            livePointsDisplay.style.color = '#81c784';
+        }
+
+        const url = new URL(window.location.href);
+
+        // 处理"启动每日活动"参数（从其他页面点按钮跳转过来）
+        if (url.searchParams.has('dailyset_start')) {
+            url.searchParams.delete('dailyset_start');
+            history.replaceState(null, '', url.toString());
+            setTimeout(startDailySet, 800);
+            return;
+        }
+
+        // 处理"每日活动完成"参数（从搜索页跳回）
+        if (url.searchParams.has('dailyset_done')) {
+            url.searchParams.delete('dailyset_done');
+            history.replaceState(null, '', url.toString());
+
+            const start = getState(STATE_KEYS.dailysetStartPoints, 0);
+            const now = readDashboardPoints();
+            let msg = '✅ 每日活动完成！打卡成功！';
+            if (now && start && now > start) {
+                msg = `✅ 每日活动完成！本次 +${now - start} 积分，打卡成功！`;
+            }
+            statusDisplay.textContent = msg;
+
+            // 刷新状态显示
+            setTimeout(updateDashboardInfo, 1500);
+            return;
+        }
+    }
+
+    // ============================================================
     //  初始化
     // ============================================================
     function init() {
@@ -1071,6 +1365,12 @@
         startAutoStartTimer();
 
         updateUI();
+
+        // rewards.bing.com 仪表盘：每日签到 + 每日活动
+        if (isRewardsDashboard()) {
+            initDashboard();
+            return;
+        }
 
         // 等待 DOM 稳定后执行页面加载逻辑
         if (document.readyState === 'loading') {
