@@ -1,8 +1,9 @@
 // ==UserScript==
 // @name         Bing Rewards Search
 // @namespace    http://tampermonkey.net/
-// @version      1.7
-// @description  在 Bing 上自动搜索 Noozra 科技新闻 + Rewards 每日签到与每日活动（3 个搜索），积累 Microsoft Rewards 积分
+// @version      1.8
+// @description  在 Bing 上自动搜索 Hacker News 科技标题 + Rewards 每日签到与每日活动（3 个搜索），积累 Microsoft Rewards 积分
+// @connect      hn.algolia.com
 // @author       You
 // @match        *://cn.bing.com/*
 // @match        *://www.bing.com/*
@@ -31,8 +32,8 @@
         // 自动启动时间（24小时制）
         autoStartHour: 4,
         autoStartMinute: 10,
-        // Noozra Tech News API
-        newsApi: 'https://noozra.com/api/articles?category=tech&limit=20',
+        // Hacker News 首页（Algolia，免 key）
+        newsApi: 'https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage=20',
         // 最多获取的新闻数
         maxItems: 20,
         // Bing 积分选择器列表（按优先级）
@@ -577,23 +578,24 @@
                 onload: function(res) {
                     try {
                         const data = JSON.parse(res.responseText);
-                        if (data.articles && Array.isArray(data.articles)) {
-                            const headlines = data.articles
-                                .slice(0, CONFIG.maxItems)
-                                .map(item => item.headline);
+                        if (data.hits && Array.isArray(data.hits)) {
+                            const headlines = data.hits
+                                .map(item => item && item.title)
+                                .filter(title => typeof title === 'string' && title.trim())
+                                .slice(0, CONFIG.maxItems);
                             resolve(headlines);
                         } else {
-                            reject(new Error('Noozra API 返回异常'));
+                            reject(new Error('Hacker News API 返回异常'));
                         }
                     } catch (e) {
-                        reject(new Error('解析 Noozra 数据失败: ' + e.message));
+                        reject(new Error('解析 Hacker News 数据失败: ' + e.message));
                     }
                 },
                 onerror: function() {
-                    reject(new Error('Noozra API 请求失败'));
+                    reject(new Error('Hacker News API 请求失败'));
                 },
                 ontimeout: function() {
-                    reject(new Error('Noozra API 请求超时'));
+                    reject(new Error('Hacker News API 请求超时'));
                 },
             });
         });
@@ -732,7 +734,7 @@
         setStatus('fetching');
         updateUI();
 
-        // 获取 Noozra 新闻标题
+        // 获取 Hacker News 标题
         fetchNewsHeadlines()
             .then(headlines => {
                 if (headlines.length === 0) {
